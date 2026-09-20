@@ -11,6 +11,16 @@ def _call(entries):
     return client.post("/api/v1/preflight", json={"entries": entries})
 
 
+def _repair(entries, repair=True):
+    return client.post(
+        "/api/v1/preflight", json={"entries": entries, "repair": repair}
+    )
+
+
+def _plan(resp):
+    return {e["index"]: e for e in resp["repair_plan"]["entries"]}
+
+
 def _by_index(resp):
     return {e["index"]: e for e in resp["entries"]}
 
@@ -152,3 +162,277 @@ def test_directory_ancestor_does_not_conflict():
     ]
     resp = _call(entries).json()
     assert resp["summary"]["hierarchy_conflicts"] == 0
+
+
+# ---------------------------------------------------------------------------
+# repair=true 修复计划
+# ---------------------------------------------------------------------------
+
+
+def test_repair_default_and_false_keep_response_compatible():
+    entries = [
+        {"path": "a.txt", "type": "file"},
+        {"path": "A.TXT", "type": "file"},
+    ]
+    assert "repair_plan" not in _call(entries).json()
+    assert "repair_plan" not in _repair(entries, repair=False).json()
+    # 显式传入其他未知行为不变：repair 省略时摘要照常给出碰撞。
+    assert _call(entries).json()["summary"]["collisions"] == 1
+
+
+def test_repair_simple_collision_first_wins():
+    entries = [
+        {"path": "docs/readme.txt", "type": "file"},
+        {"path": "Docs/ReadMe.TXT", "type": "file"},
+        {"path": "docs/readme.txt.  ", "type": "file"},
+        {"path": "docs/other.md", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "docs/readme.txt"
+    assert plan[1]["reasons"] == []
+    assert plan[2]["repaired_path"] == "Docs/ReadMe (1).TXT"
+    assert plan[2]["reasons"] == ["COLLISION"]
+    assert plan[3]["repaired_path"] == "docs/readme (2).txt"
+    assert plan[3]["reasons"] == ["COLLISION"]
+    # 无冲突条目的 repaired_path 等于 canonical_path。
+    assert plan[4]["repaired_path"] == "docs/other.md"
+    assert plan[4]["skipped"] is False
+    rp = resp["repair_plan"]
+    assert rp["renamed_count"] == 2
+    assert rp["skipped_count"] == 0
+    assert rp["collisions_remaining"] == 0
+    assert rp["hierarchy_conflicts_remaining"] == 0
+    assert rp["collisions_resolved"] == 1
+    assert rp["hierarchy_conflicts_resolved"] == 0
+    # 原诊断字段仍然保留。
+    by = _by_index(resp)
+    assert by[1]["collision_group"] == 1
+
+
+def test_repair_hierarchy_conflict_renames_blocking_file():
+    entries = [
+        {"path": "a/b", "type": "file"},
+        {"path": "a/b/c.txt", "type": "file"},
+        {"path": "a/b/sub", "type": "directory"},
+        {"path": "a/b2/c.txt", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "a/b (1)"
+    assert plan[1]["reasons"] == ["BLOCKS_DESCENDANT"]
+    assert plan[2]["repaired_path"] == "a/b/c.txt"
+    assert plan[2]["reasons"] == []
+    assert plan[3]["repaired_path"] == "a/b/sub"
+    assert plan[4]["repaired_path"] == "a/b2/c.txt"
+    rp = resp["repair_plan"]
+    assert rp["renamed_count"] == 1
+    assert rp["hierarchy_conflicts_resolved"] == 2
+    assert rp["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_collision_keeper_must_not_block_descendants():
+    # 先出现的是阻挡后代的文件，后出现的目录不阻挡 -> 目录胜出保留。
+    entries = [
+        {"path": "a/b", "type": "file"},
+        {"path": "a/b", "type": "directory"},
+        {"path": "a/b/c", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "a/b (1)"
+    assert plan[1]["reasons"] == ["COLLISION", "BLOCKS_DESCENDANT"]
+    assert plan[2]["repaired_path"] == "a/b"
+    assert plan[2]["reasons"] == []
+    assert plan[3]["repaired_path"] == "a/b/c"
+    assert resp["repair_plan"]["collisions_remaining"] == 0
+    assert resp["repair_plan"]["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_n_increments_past_name_and_hierarchy_clashes():
+    # #1 文件 a 阻挡 #2/#3；#4 文件 a (1) 阻挡 #5。
+    # #1 改名时 a (1) 已被保留者 #4 预占（且其为文件祖先），须跳到 a (2)；
+    # #4 自身阻挡后代，改名为 "a (1) (1)"。
+    entries = [
+        {"path": "a", "type": "file"},
+        {"path": "a/x", "type": "file"},
+        {"path": "a/y", "type": "file"},
+        {"path": "a (1)", "type": "file"},
+        {"path": "a (1)/z", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "a (2)"
+    assert plan[2]["repaired_path"] == "a/x"
+    assert plan[3]["repaired_path"] == "a/y"
+    assert plan[4]["repaired_path"] == "a (1) (1)"
+    assert plan[5]["repaired_path"] == "a (1)/z"
+    rp = resp["repair_plan"]
+    assert rp["collisions_remaining"] == 0
+    assert rp["hierarchy_conflicts_remaining"] == 0
+    assert rp["hierarchy_conflicts_resolved"] == 3
+    assert rp["renamed_count"] == 2
+
+
+def test_repair_candidate_under_future_file_skips_n():
+    # 候选 "a (1)" 自身无冲突，但其目录下存在保留者文件 #4，
+    # 若文件候选落到 a (1) 会阻挡 #4 -> 跳到 a (2)。
+    entries = [
+        {"path": "a", "type": "file"},
+        {"path": "a/x", "type": "file"},
+        {"path": "a/y", "type": "file"},
+        {"path": "a (1)/q", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "a (2)"
+    assert plan[4]["repaired_path"] == "a (1)/q"
+    assert resp["repair_plan"]["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_extension_insertion_boundaries():
+    entries = [
+        {"path": "Makefile", "type": "file"},  # 无扩展名
+        {"path": "makefile", "type": "file"},
+        {"path": ".gitignore", "type": "file"},  # 点文件整体为词干
+        {"path": ".GITIGNORE", "type": "file"},
+        {"path": "tar.tar.gz", "type": "file"},  # 只在最后一个扩展名前插入
+        {"path": "TAR.TAR.GZ", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[2]["repaired_path"] == "makefile (1)"
+    assert plan[4]["repaired_path"] == ".GITIGNORE (1)"
+    assert plan[6]["repaired_path"] == "TAR.TAR (1).GZ"
+
+
+def test_repair_unsafe_entries_are_skipped():
+    entries = [
+        {"path": "/etc/passwd", "type": "file"},
+        {"path": "CON", "type": "file"},
+        {"path": "safe.txt", "type": "file"},
+        {"path": "../escape", "type": "file"},
+        {"path": "SAFE.TXT", "type": "file"},  # 仅与安全条目碰撞
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    for i in (1, 2, 4):
+        assert plan[i]["skipped"] is True
+        assert plan[i]["repaired_path"] is None
+        assert plan[i]["reasons"] == ["UNSAFE"]
+    assert plan[3]["repaired_path"] == "safe.txt"
+    assert plan[3]["reasons"] == []
+    assert plan[5]["repaired_path"] == "SAFE (1).TXT"
+    assert plan[5]["reasons"] == ["COLLISION"]
+    rp = resp["repair_plan"]
+    assert rp["skipped_count"] == 3
+    assert rp["renamed_count"] == 1
+    assert rp["collisions_remaining"] == 0
+    assert rp["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_plan_order_and_no_conflict_passthrough():
+    entries = [
+        {"path": "z/last.txt", "type": "file"},
+        {"path": "a/dir", "type": "directory"},
+        {"path": "a/dir/child.bin", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan_entries = resp["repair_plan"]["entries"]
+    assert [e["index"] for e in plan_entries] == [1, 2, 3]
+    assert [e["repaired_path"] for e in plan_entries] == [
+        "z/last.txt",
+        "a/dir",
+        "a/dir/child.bin",
+    ]
+    assert all(e["reasons"] == [] for e in plan_entries)
+    assert resp["repair_plan"]["renamed_count"] == 0
+
+
+def test_repair_nfc_and_trim_collision_uses_canonical_display():
+    nfd_ring = unicodedata.normalize("NFD", "Å")
+    entries = [
+        {"path": f"docs/caf{nfd_ring}.txt", "type": "file"},
+        {"path": "docs/CAFÅ.TXT", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "docs/cafÅ.txt"
+    assert plan[2]["repaired_path"] == "docs/CAFÅ (1).TXT"
+
+
+def test_repair_all_collision_members_block_descendants():
+    # 两个同键文件都阻挡各自后代 -> 无保留者，全部改名且互不碰撞。
+    entries = [
+        {"path": "a/b", "type": "file"},
+        {"path": "a/b", "type": "file"},
+        {"path": "a/b/c", "type": "file"},
+        {"path": "a/b/d", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "a/b (1)"
+    assert plan[2]["repaired_path"] == "a/b (2)"
+    assert plan[3]["repaired_path"] == "a/b/c"
+    assert plan[4]["repaired_path"] == "a/b/d"
+    rp = resp["repair_plan"]
+    assert rp["collisions_remaining"] == 0
+    assert rp["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_directory_ancestor_is_not_a_clash():
+    # 回归：候选位于已占用目录之下（段前缀但非文件祖先）合法，n 应从 1 开始。
+    # #1 文件 p 与 #2 目录 p 碰撞 -> 目录胜出，文件改名 p (1)；
+    # #1 同时阻挡 #3，故带两个原因。
+    entries = [
+        {"path": "p", "type": "file"},
+        {"path": "p", "type": "directory"},
+        {"path": "p/q", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "p (1)"
+    assert plan[1]["reasons"] == ["COLLISION", "BLOCKS_DESCENDANT"]
+    assert plan[2]["repaired_path"] == "p"
+    assert plan[3]["repaired_path"] == "p/q"
+    assert resp["repair_plan"]["hierarchy_conflicts_remaining"] == 0
+
+
+def test_repair_nested_sibling_prefix_not_ancestor():
+    # 回归：'p' 与 'p2' 仅共享首字符而非路径段前缀；目录 p 存在时，
+    # 文件 p2/x 完全合法，无冲突条目不改名。
+    entries = [
+        {"path": "p", "type": "directory"},
+        {"path": "p2/x", "type": "file"},
+        {"path": "other", "type": "file"},
+    ]
+    resp = _repair(entries).json()
+    plan = _plan(resp)
+    assert plan[1]["repaired_path"] == "p"
+    assert plan[2]["repaired_path"] == "p2/x"
+    assert plan[3]["repaired_path"] == "other"
+    assert resp["repair_plan"]["renamed_count"] == 0
+    assert resp["repair_plan"]["hierarchy_conflicts_remaining"] == 0
+
+
+def test_clash_prefix_predicate_unit():
+    # 直接覆盖 _has_hierarchy_clash 的四个方向，防止段前缀判定回归。
+    from app.repair import _Claim, _has_hierarchy_clash
+
+    file_claim = _Claim(("p",), is_file=True)
+    dir_claim = _Claim(("p",), is_file=False)
+
+    # 候选位于已占用路径之下：文件祖先阻挡，目录祖先不阻挡。
+    assert _has_hierarchy_clash(("p", "x"), True, file_claim) is True
+    assert _has_hierarchy_clash(("p", "x"), False, file_claim) is True
+    assert _has_hierarchy_clash(("p", "x"), True, dir_claim) is False
+    # 仅首字符相同的兄弟段不算祖先。
+    assert _has_hierarchy_clash(("p2", "x"), True, dir_claim) is False
+    assert _has_hierarchy_clash(("p2", "x"), True, file_claim) is False
+    # 候选文件是已占用路径的祖先 -> 冲突；候选目录则不冲突。
+    assert _has_hierarchy_clash(("p",), True, _Claim(("p", "x"), False)) is True
+    assert _has_hierarchy_clash(("p",), False, _Claim(("p", "x"), False)) is False
+    # 同名即碰撞，与类型无关。
+    assert _has_hierarchy_clash(("p",), False, dir_claim) is True
+
+

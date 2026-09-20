@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .schemas import HealthResponse, PreflightRequest, PreflightResponse
+from .schemas import HealthResponse, PreflightRepairResponse, PreflightRequest
 from .service import run_preflight
 
 app = FastAPI(
@@ -37,9 +37,10 @@ def root() -> dict[str, str]:
 
 @app.post(
     "/api/v1/preflight",
-    response_model=PreflightResponse,
+    response_model=None,  # repair=false 时响应不含 repair_plan；由 service 层返回具体模型
+    responses={200: {"model": PreflightRepairResponse}},  # 仅供 OpenAPI 文档展示超集
     tags=["preflight"],
-    summary="批量预检压缩包条目路径",
+    summary="批量预检压缩包条目路径（repair=true 时附修复计划）",
 )
-def preflight(request: PreflightRequest) -> PreflightResponse:
+def preflight(request: PreflightRequest):
     return run_preflight(request)

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
+from .repair import build_repair_plan
 from .schemas import (
     CollisionGroup,
     CollisionMember,
     EntryType,
     HierarchyConflict,
     PreflightEntryOut,
+    PreflightRepairResponse,
     PreflightRequest,
     PreflightResponse,
     Summary,
@@ -144,6 +146,10 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         CollisionGroup(**groups_detail[no])
         for no in sorted(groups_detail)
     ]
+    group_members: dict[int, list[int]] = {
+        no: [m.index for m in groups_detail[no]["members"]]
+        for no in sorted(groups_detail)
+    }
 
     # 碰撞提示问题。
     for entry in normalized:
@@ -192,6 +198,23 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         collision_entries=len(index_to_group),
         hierarchy_conflicts=len(hierarchy_out),
     )
+
+    if request.repair:
+        repair_plan = build_repair_plan(
+            entries=normalized,
+            collision_groups=group_members,
+            blocks=blocks,
+            collisions_total=len(collision_groups),
+            hierarchy_total=len(hierarchy_out),
+        )
+        return PreflightRepairResponse(
+            target="windows",
+            entries=entry_out,
+            collision_groups=collision_groups,
+            hierarchy_conflicts=hierarchy_out,
+            summary=summary,
+            repair_plan=repair_plan,
+        )
 
     return PreflightResponse(
         target="windows",

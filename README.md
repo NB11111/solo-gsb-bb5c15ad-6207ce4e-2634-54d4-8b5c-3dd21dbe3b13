@@ -2,7 +2,8 @@
 
 使用 **Python + FastAPI + 纯内存计算** 的跨平台压缩包路径预检服务。
 接收待解包条目的原始路径与 `file` / `directory` 类型，按 **Windows 目标规则**
-规范化路径，识别危险条目，并输出同名碰撞组与文件-目录层级冲突。
+规范化路径，识别危险条目，并输出同名碰撞组与文件-目录层级冲突；
+请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -57,12 +58,15 @@ pytest -q
     { "path": "../evil.bin", "type": "file" },
     { "path": "a/b", "type": "file" },
     { "path": "a/b/c.txt", "type": "file" }
-  ]
+  ],
+  "repair": false
 }
 ```
 
-`type` 仅接受 `file` 或 `directory`。响应中的 `entries` **严格保持输入顺序**，
-`index` 从 1 开始。
+`type` 仅接受 `file` 或 `directory`。`repair` 为可选布尔值，省略或为 `false`
+时响应与旧版完全一致（不含 `repair_plan` 字段）；为 `true` 时额外返回
+确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
+响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
 
 响应关键字段：
 
@@ -127,6 +131,76 @@ curl -s http://localhost:8000/api/v1/preflight \
   祖先路径（如文件 `a/b` 与后代 `a/b/c.txt`），解包时无法在同名路径上创建目录，
   记为层级冲突。目录占据祖先路径属于正常布局，不报告。
 
+## 修复计划（`repair=true`）
+
+请求体加 `"repair": true` 后，响应在原有字段之外**额外**包含 `repair_plan`
+（`repair` 省略或为 `false` 时该字段不出现，响应保持兼容）。原有诊断结果
+（`collision_groups`、`hierarchy_conflicts`、`entries[].issues` 等）保持不变，
+修复计划只是附加建议。
+
+修复规则：
+
+1. **只处理安全条目**。不安全条目标记 `"skipped": true`、`repaired_path` 为
+   `null`、`reasons` 为 `["UNSAFE"]`，绝不改名，也不参与碰撞/层级复检。
+2. **同名碰撞**：保留碰撞组中**最先出现且自身不阻挡后代**的条目（目录也算），
+   其余条目在**末段扩展名前**插入 ` (n)`，n 从 1 递增。若组内所有条目都阻挡
+   后代，则无保留者、全部改名。
+3. **文件阻挡后代**：重命名**阻挡的文件本身**（被阻挡的后代保留原名）。
+4. **扩展名切分**：以最后一个 `.` 为分隔点；以 `.` 开头的点文件
+   （如 `.gitignore`）整体视为词干；无扩展名则在段尾追加。
+   例：`readme.txt` → `readme (1).txt`，`tar.tar.gz` → `tar.tar (1).gz`，
+   `Makefile` → `Makefile (1)`。
+5. **候选校验**：每个候选名均按 Windows `comparison_key`（`casefold`）同时检查
+   - 与任一**已占用路径**同名（碰撞）；
+   - 候选为文件时占据已占用路径的祖先、或已占用文件是候选的祖先（层级冲突）。
+
+   检查同时针对“已处理条目”和“确定保留原名的未来条目”，递增 n 直至两者均不
+   冲突，因此整批复检结果恒为无冲突。
+6. 无冲突的安全条目不改名，`reasons` 为空，`repaired_path` 等于 `canonical_path`。
+   同一原因不会重复列出；同时命中碰撞与层级冲突的条目，
+   `reasons` 为 `["COLLISION", "BLOCKS_DESCENDANT"]`。
+
+`repair_plan` 结构：
+
+```json
+{
+  "entries": [
+    {
+      "index": 2,
+      "original_path": "Docs/ReadMe.TXT",
+      "repaired_path": "Docs/ReadMe (1).TXT",
+      "reasons": ["COLLISION"],
+      "skipped": false
+    }
+  ],
+  "renamed_count": 1,
+  "skipped_count": 0,
+  "collisions_remaining": 0,
+  "hierarchy_conflicts_remaining": 0,
+  "collisions_resolved": 1,
+  "hierarchy_conflicts_resolved": 0
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries` | 按**输入顺序**逐条给出 `index`、`original_path`、`repaired_path`、`reasons`、`skipped` |
+| `renamed_count` | 实际改名的安全条目数量 |
+| `skipped_count` | 因不安全被跳过的条目数量 |
+| `collisions_remaining` / `hierarchy_conflicts_remaining` | 按 `repaired_path` 复检的剩余两类冲突计数（恒为 `0`） |
+| `collisions_resolved` / `hierarchy_conflicts_resolved` | 修复消除的两类冲突数量（分别等于原 `summary.collisions` 与 `summary.hierarchy_conflicts`） |
+
+`reasons` 取值：`COLLISION`（同名碰撞改让）、`BLOCKS_DESCENDANT`
+（文件阻挡后代而改名）、`UNSAFE`（仅 skipped 条目）。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"repair":true,"entries":[{"path":"a/b","type":"file"},{"path":"a/b/c.txt","type":"file"}]}'
+```
+
 ## 项目结构
 
 ```
@@ -134,8 +208,9 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型
-│   └── service.py       # 碰撞分组与层级冲突编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan）
+│   ├── service.py       # 碰撞分组与层级冲突编排
+│   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
 ├── Dockerfile

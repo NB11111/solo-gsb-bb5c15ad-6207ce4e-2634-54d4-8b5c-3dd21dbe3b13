@@ -23,6 +23,10 @@ class PreflightRequest(BaseModel):
     entries: list[PreflightEntryIn] = Field(
         ..., min_length=1, description="待预检的条目列表（至少 1 条）"
     )
+    repair: bool = Field(
+        default=False,
+        description="为 true 时生成确定性 repair_plan（同名碰撞与文件祖先冲突修复建议）",
+    )
 
 
 class IssueOut(BaseModel):
@@ -81,12 +85,62 @@ class Summary(BaseModel):
     hierarchy_conflicts: int
 
 
+class RepairReason(str, Enum):
+    COLLISION = "COLLISION"
+    BLOCKS_DESCENDANT = "BLOCKS_DESCENDANT"
+    UNSAFE = "UNSAFE"
+
+
+class RepairEntry(BaseModel):
+    index: int = Field(..., description="条目下标（与输入顺序一致，从 1 开始）")
+    original_path: str = Field(..., description="原始输入路径")
+    repaired_path: str | None = Field(
+        ...,
+        description=(
+            "修复后路径（正斜杠分隔）。安全且未改名的条目等于 canonical_path；"
+            "不安全条目为 null"
+        ),
+    )
+    reasons: list[RepairReason] = Field(
+        default_factory=list,
+        description=(
+            "修复原因：COLLISION（同名碰撞改让）、"
+            "BLOCKS_DESCENDANT（文件阻挡后代而改名）；skipped 条目为 [UNSAFE]"
+        ),
+    )
+    skipped: bool = Field(..., description="不安全条目不参与修复，恒为 true")
+
+
+class RepairPlan(BaseModel):
+    entries: list[RepairEntry] = Field(
+        ..., description="按输入顺序排列的逐条修复计划"
+    )
+    renamed_count: int = Field(..., description="实际改名的安全条目数量")
+    skipped_count: int = Field(..., description="因不安全被跳过的条目数量")
+    collisions_remaining: int = Field(
+        ..., description="按 repaired_path 复检后的同名碰撞组数（恒为 0）"
+    )
+    hierarchy_conflicts_remaining: int = Field(
+        ..., description="按 repaired_path 复检后的文件祖先冲突对数（恒为 0）"
+    )
+    collisions_resolved: int = Field(
+        ..., description="修复消除的同名碰撞组数（等于原 summary.collisions）"
+    )
+    hierarchy_conflicts_resolved: int = Field(
+        ..., description="修复消除的文件祖先冲突对数（等于原 summary.hierarchy_conflicts）"
+    )
+
+
 class PreflightResponse(BaseModel):
     target: str = "windows"
     entries: list[PreflightEntryOut]
     collision_groups: list[CollisionGroup]
     hierarchy_conflicts: list[HierarchyConflict]
     summary: Summary
+
+
+class PreflightRepairResponse(PreflightResponse):
+    repair_plan: RepairPlan
 
 
 class HealthResponse(BaseModel):
