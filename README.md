@@ -57,12 +57,15 @@ pytest -q
     { "path": "../evil.bin", "type": "file" },
     { "path": "a/b", "type": "file" },
     { "path": "a/b/c.txt", "type": "file" }
-  ]
+  ],
+  "repair": true
 }
 ```
 
 `type` 仅接受 `file` 或 `directory`。响应中的 `entries` **严格保持输入顺序**，
-`index` 从 1 开始。
+`index` 从 1 开始。`repair` 可选（默认 `false`）：为 `true` 时响应额外包含
+`repair_plan`（见下文「修复计划」）；省略或为 `false` 时响应结构与之前完全一致
+（`repair_plan` 为 `null`）。
 
 响应关键字段：
 
@@ -78,6 +81,7 @@ pytest -q
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
 | `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts` 计数 |
+| `repair_plan` | 修复计划；仅当请求 `repair=true` 时返回，否则为 `null` |
 
 curl 示例：
 
@@ -127,6 +131,56 @@ curl -s http://localhost:8000/api/v1/preflight \
   祖先路径（如文件 `a/b` 与后代 `a/b/c.txt`），解包时无法在同名路径上创建目录，
   记为层级冲突。目录占据祖先路径属于正常布局，不报告。
 
+## 修复计划（`repair=true`）
+
+请求体带 `"repair": true` 时，响应额外包含 `repair_plan`：对**安全但存在同名碰撞
+或文件祖先冲突**的条目生成**确定性**的 `repaired_path`。改名规则：
+
+1. **同名碰撞**：组内保留**最先出现且不阻挡后代**的条目，其余在**末段扩展名前**
+   插入 ` (n)`（n 从 1 开始）。无扩展名直接追加（`README` → `README (1)`）；
+   dotfile 整体作词干（`.gitignore` → `.gitignore (1)`）；多扩展名只认最后一段
+   （`archive.tar.gz` → `archive.tar (1).gz`）。原名已含 ` (k)` 时机械插入，
+   得到 ` (k) (n)` 形式。改名保留条目自身的大小写。
+2. **文件阻挡后代**：重命名该文件（同样插入 ` (n)`），后代条目保持不动。
+3. 每个候选名都按 Windows `comparison_key` **同时**校验同名碰撞与双向层级冲突
+   （既不撞已有键，也不落在任何文件之下、不让文件压住别人），冲突则 n 递增，
+   直至整批无冲突。改名按原始键深度递增顺序处理，保证有限步内收敛。
+4. **不安全条目**不参与改名：标记 `skipped`，`repaired_path` 为 `null`。
+
+`repair_plan` 结构：
+
+```json
+{
+  "items": [
+    { "index": 1, "original_path": "docs/readme.txt",  "repaired_path": "docs/readme.txt",      "status": "kept",    "reasons": [] },
+    { "index": 2, "original_path": "docs/README.TXT",  "repaired_path": "docs/README (1).TXT",  "status": "renamed", "reasons": ["collision"] },
+    { "index": 3, "original_path": "../evil.bin",      "repaired_path": null,                   "status": "skipped", "reasons": [] }
+  ],
+  "renamed": 1,
+  "skipped": 1,
+  "remaining_collisions": 0,
+  "remaining_hierarchy_conflicts": 0
+}
+```
+
+- `items` **按输入顺序**覆盖全部条目；`status` 为 `kept`（保留原名）、
+  `renamed`（已改名）或 `skipped`（不安全跳过）。
+- `reasons` 仅 `renamed` 条目非空，取值为 `collision` / `blocks_descendants`
+  （两者可同时成立，如既碰撞又阻挡后代的文件）。
+- `kept` 条目的 `repaired_path` 即其 `canonical_path`。
+- `remaining_collisions` / `remaining_hierarchy_conflicts` 为**修复后**仍存在的
+  两类冲突计数（对修复后的最终键重新检测，正常为 `0`）。
+- `repair_plan` 不影响原有字段：`entries` / `collision_groups` /
+  `hierarchy_conflicts` / `summary` 始终基于**原始路径**的分析结果。
+
+curl 示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/preflight \
+  -H 'Content-Type: application/json' \
+  -d '{"repair": true, "entries":[{"path":"a/b","type":"file"},{"path":"a/b/c.txt","type":"file"}]}'
+```
+
 ## 项目结构
 
 ```
@@ -134,8 +188,9 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
+│   ├── repair.py        # 确定性改名修复计划（repair=true 时启用）
 │   ├── schemas.py       # Pydantic 请求/响应模型
-│   └── service.py       # 碰撞分组与层级冲突编排
+│   └── service.py       # 碰撞分组、层级冲突与修复计划编排
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
 ├── Dockerfile

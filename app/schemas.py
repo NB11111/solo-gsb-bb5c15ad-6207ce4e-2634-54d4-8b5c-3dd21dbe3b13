@@ -23,6 +23,13 @@ class PreflightRequest(BaseModel):
     entries: list[PreflightEntryIn] = Field(
         ..., min_length=1, description="待预检的条目列表（至少 1 条）"
     )
+    repair: bool = Field(
+        False,
+        description=(
+            "为 true 时额外返回 repair_plan：对安全但存在同名碰撞或文件祖先冲突的"
+            "条目生成确定性的修复路径；不安全条目跳过不改名"
+        ),
+    )
 
 
 class IssueOut(BaseModel):
@@ -72,6 +79,42 @@ class PreflightEntryOut(BaseModel):
     issues: list[IssueOut] = Field(default_factory=list)
 
 
+class RepairReason(str, Enum):
+    COLLISION = "collision"
+    BLOCKS_DESCENDANTS = "blocks_descendants"
+
+
+class RepairStatus(str, Enum):
+    KEPT = "kept"
+    RENAMED = "renamed"
+    SKIPPED = "skipped"
+
+
+class RepairItem(BaseModel):
+    index: int = Field(..., description="条目下标（从 1 开始，与输入顺序一致）")
+    original_path: str
+    repaired_path: str | None = Field(
+        ..., description="修复后的最终规范路径；不安全（skipped）条目为 null"
+    )
+    status: RepairStatus = Field(
+        ...,
+        description="kept=保留原名，renamed=已改名，skipped=不安全条目跳过不改名",
+    )
+    reasons: list[RepairReason] = Field(
+        default_factory=list, description="改名原因（仅 renamed 条目非空）"
+    )
+
+
+class RepairPlan(BaseModel):
+    items: list[RepairItem] = Field(..., description="按输入顺序逐条对应全部条目")
+    renamed: int = Field(..., description="被改名的条目数")
+    skipped: int = Field(..., description="不安全而被跳过的条目数")
+    remaining_collisions: int = Field(..., description="修复后仍存在的同名碰撞组数")
+    remaining_hierarchy_conflicts: int = Field(
+        ..., description="修复后仍存在的文件-目录层级冲突对数"
+    )
+
+
 class Summary(BaseModel):
     total: int
     safe: int
@@ -87,6 +130,9 @@ class PreflightResponse(BaseModel):
     collision_groups: list[CollisionGroup]
     hierarchy_conflicts: list[HierarchyConflict]
     summary: Summary
+    repair_plan: RepairPlan | None = Field(
+        None, description="修复计划；仅当请求 repair=true 时返回，否则为 null"
+    )
 
 
 class HealthResponse(BaseModel):

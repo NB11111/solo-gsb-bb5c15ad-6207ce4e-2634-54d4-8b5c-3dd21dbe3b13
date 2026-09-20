@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
+from .repair import build_repair_plan
 from .schemas import (
     CollisionGroup,
     CollisionMember,
@@ -193,10 +194,17 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         hierarchy_conflicts=len(hierarchy_out),
     )
 
+    repair_plan = (
+        build_repair_plan(normalized, index_to_group, blocks)
+        if request.repair
+        else None
+    )
+
     return PreflightResponse(
         target="windows",
         entries=entry_out,
         collision_groups=collision_groups,
         hierarchy_conflicts=hierarchy_out,
         summary=summary,
+        repair_plan=repair_plan,
     )
